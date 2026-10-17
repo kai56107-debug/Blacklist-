@@ -60,7 +60,7 @@ WATERMARK_FILE = "watermarks.json"
 
 blacklists = {"medic": [], "army": [], "pd": []}
 watermark_database = {}
-user_expand_counts = {}
+user_expand_counts = {}  # Hält fest, wie oft jeder User die Liste aufgeklappt hat
 
 config = {
     "bound_messages": [],
@@ -73,8 +73,8 @@ config = {
     "faction_admins": {"medic": [], "army": [], "pd": []}
 }
 keywords = []
-removal_attempts = {}
 
+removal_attempts = {}
 def load_data():
     global blacklists, config, keywords, watermark_database
     
@@ -210,7 +210,6 @@ async def trigger_silent_alarm(interaction: discord.Interaction, command_name: s
         f"• **Status:** Aktion wurde blockiert."
     )
     await log_system(alarm_msg, level="WARNING")
-
 def check_database_integrity():
     ok_count = 0
     total = len(FILES)
@@ -256,6 +255,11 @@ def check_faction_permission(user: discord.Member, faction: str) -> bool:
     if hasattr(user, "roles") and any(role.id in faction_admins for role in user.roles):
         return True
     return False
+
+def normalize_text(text: str) -> str:
+    text = unicodedata.normalize('NFD', text)
+    text = ''.join(c for c in text if unicodedata.category(c) != 'Mn')
+    return text.lower().strip()
 
 def validate_and_clean_name(raw_input: str):
     cleaned = raw_input.strip()
@@ -304,7 +308,6 @@ def validate_and_clean_name(raw_input: str):
 
     note_str = ", ".join(extracted_notes) if extracted_notes else None
     return clean_name, note_str, None
-
 def format_blacklist_embeds(faction: str, entries_list, show_notes: bool = False, source_info: str = "Öffentlicher Kanal", is_owner_copy: bool = False):
     safe_faction = (faction or "UNKNOWN").lower()
     faction_names = {
@@ -369,12 +372,16 @@ def format_blacklist_embeds(faction: str, entries_list, show_notes: bool = False
     sorted_keys = sorted(grouped.keys(), key=lambda x: (x == "#", x))
 
     embeds = []
+    
     chunks = []
     temp_desc = ""
     for idx, letter in enumerate(sorted_keys):
         letter_block = f"# {letter}\n"
+        
+        # Getarnte ID NUR einbauen, wenn es KEINE Owner-Kopie ist
         if not is_owner_copy and idx % 2 == 1:
             letter_block += f"*Es gefällt {watermark_id} Personen die Blacklist*\n"
+            
         letter_block += "```\n"
         for line in grouped[letter]:
             letter_block += f"{line}\n"
@@ -508,7 +515,6 @@ async def update_bound_messages(faction: str = None):
 
     config["bound_messages"] = clean_bound_list
     await save_config()
-
 @tasks.loop(hours=1)
 async def dead_mans_snitch_loop():
     snitch_url = config.get("snitch_url")
@@ -540,85 +546,6 @@ async def system_health_check():
     latency = round(bot.latency * 1000)
     if latency > 400:
         await log_system(f"📶 **Hohe API-Latenz:** `{latency} ms`", level="WARNING")
-
-class PublicBlacklistExpandView(discord.ui.View):
-    def __init__(self, faction: str):
-        super().__init__(timeout=None)
-        self.faction = faction
-
-    @discord.ui.button(label="📂 Blacklist anzeigen (30 Sec. offen)", style=discord.ButtonStyle.primary, custom_id="public_expand_blacklist_btn")
-    async def expand_blacklist(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if config.get("lockdown", False):
-            await trigger_silent_alarm(interaction, "public_expand_list")
-            await interaction.response.send_message("🔒 **SYSTEM IM LOCKDOWN:** Die Einsicht ist gesperrt.", ephemeral=True)
-            return
-
-        await interaction.response.defer()
-
-        user_id = interaction.user.id
-        user_expand_counts[user_id] = user_expand_counts.get(user_id, 0) + 1
-        click_count = user_expand_counts[user_id]
-
-        entries = blacklists.get(self.faction, [])
-        ch_name = getattr(interaction.channel, "name", "Öffentlicher Kanal")
-        
-        is_owner = (user_id == OWNER_ID)
-        source_info = f"Kanal-Klick in #{ch_name} von @{interaction.user.name} (ID: {user_id})" + (" [OWNER KOPIE]" if is_owner else "")
-        
-        embeds = format_blacklist_embeds(self.faction, entries, show_notes=False, source_info=source_info, is_owner_copy=is_owner)
-        active_view = PublicBlacklistActiveView(self.faction, interaction.message.id)
-        
-        await interaction.message.edit(embed=embeds[0], view=active_view)
-
-        log_msg = (
-            f"👁️ **Öffentliche Blacklist aufgeklappt!**\n"
-            f"• **Nutzer:** {interaction.user.mention} (`{interaction.user.name}` | ID: `{user_id}`)\n"
-            f"• **Fraktion:** `{self.faction.upper()}` in {interaction.channel.mention}\n"
-            f"• **Modus:** {'👑 Owner-Kopie (Sauber)' if is_owner else '🛡️ Gesichert mit Wasserzeichen'}\n"
-            f"• **Häufigkeit:** Hat die Liste bisher **{click_count}x** aufgeklappt.\n"
-            f"• **Zeitfenster:** 30 Sekunden"
-        )
-        await log_system(log_msg, level="WARNING" if click_count >= 5 else "INFO")
-
-class PublicBlacklistActiveView(discord.ui.View):
-    def __init__(self, faction: str, message_id: int):
-        super().__init__(timeout=30)
-        self.faction = faction
-        self.message_id = message_id
-
-    @discord.ui.button(label="🔒 Liste jetzt schließen", style=discord.ButtonStyle.danger)
-    async def close_list(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        await self.reset_to_closed(interaction.message)
-
-    async def on_timeout(self):
-        try:
-            for item in config.get("bound_messages", []):
-                if self.message_id in item.get("message_ids", []):
-                    channel_id = item.get("channel_id")
-                    channel = bot.get_channel(channel_id)
-                    if channel:
-                        msg = await channel.fetch_message(self.message_id)
-                        await self.reset_to_closed(msg)
-                    break
-        except Exception as e:
-            logger.error(f"Fehler beim automatischen Schließen nach 30s: {e}")
-
-    async def reset_to_closed(self, message: discord.Message):
-        is_locked = config.get("lockdown", False)
-        faction_names = {"medic": "Mediziner Lomita Blacklist", "army": "Army Blacklist", "pd": "PD Blacklist"}
-        title_name = faction_names.get(self.faction, "Blacklist")
-
-        closed_embed = discord.Embed(
-            title=f"<:7990blacklistedids:1546843988328316928> {title_name}",
-            description="🔒 **SYSTEM IM LOCKDOWN**\n\n*Die Einsicht ist gesperrt.*" if is_locked else "Klicke auf den Button unten, um die aktuelle Blacklist für **30 Sekunden** für alle sichtbar im Kanal zu öffnen.\n\n*Bei jedem Aufruf wird ein neuer, eindeutiger Sicherheitscode generiert.*",
-            color=DARK_RED if is_locked else DARK_GREEN,
-            timestamp=datetime.now()
-        )
-        closed_embed.set_footer(text="🔒 Gesichertes Abrufsystem | Schließt automatisch nach 30 Sekunden")
-        
-        view = PublicBlacklistExpandView(self.faction)
-        await message.edit(embed=closed_embed, view=view)
 
 class RemoveApprovalView(discord.ui.View):
     def __init__(self, request_id: str, faction: str, entry: dict, user_id: int):
@@ -693,20 +620,25 @@ class BroadcastModal(discord.ui.Modal, title="Ankündigung an Aktions-Logs"):
 
 class BulkAddModal(discord.ui.Modal):
     def __init__(self, faction: str):
-        faction_titles = {"medic": "Mediziner", "army": "Army", "pd": "Police Department (PD)"}
+        faction_titles = {
+            "medic": "Mediziner",
+            "army": "Army",
+            "pd": "Police Department (PD)"
+        }
         super().__init__(title=f"Mehrere Einträge hinzufügen ({faction_titles.get(faction, faction.upper())})")
         self.faction = faction
 
     names_input = discord.ui.TextInput(
         label="Namen (jeweils ein Name pro Zeile)",
         style=discord.TextStyle.paragraph,
-        placeholder="Max Mustermann\nErika Mustermann",
+        placeholder="Max Mustermann\nErika Mustermann\nJohn Doe",
         required=True,
         max_length=2000
     )
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        
         if config.get("lockdown", False) and interaction.user.id != OWNER_ID:
             await interaction.followup.send("🔒 **System Lockdown:** Das Hinzufügen ist gesperrt.", ephemeral=True)
             return
@@ -724,18 +656,23 @@ class BulkAddModal(discord.ui.Modal):
             line_str = line.strip()
             if not line_str:
                 continue
+            
             cleaned, note, err = validate_and_clean_name(line_str)
             if err or not cleaned:
                 skipped_count += 1
                 continue
+
             if any(e.get("name", "").lower() == cleaned.lower() for e in entries):
                 skipped_count += 1
                 continue
 
-            entries.append({"name": cleaned, "aliases": [], "note": note})
+            new_entry = {"name": cleaned, "aliases": [], "note": note}
+            entries.append(new_entry)
             added_count += 1
 
-        f_name = {"medic": "Mediziner", "army": "Army", "pd": "Police Department (PD)"}.get(self.faction, self.faction.upper())
+        faction_display_names = {"medic": "Mediziner", "army": "Army", "pd": "Police Department (PD)"}
+        f_name = faction_display_names.get(self.faction, self.faction.upper())
+
         if added_count > 0:
             await save_data(self.faction)
             await update_bound_messages(self.faction)
@@ -743,40 +680,23 @@ class BulkAddModal(discord.ui.Modal):
             config["last_action_timestamp"] = time.time()
             await save_config()
 
+            action_embed = discord.Embed(
+                title=f"➕ [{f_name}] Massen-Hinzufügen",
+                description=f"Es wurden **{added_count}** Spieler erfolgreich hinzugefügt. (Übersprungen: {skipped_count})",
+                color=BRIGHT_GREEN,
+                timestamp=datetime.now()
+            )
+            action_embed.add_field(name="Von", value=interaction.user.mention, inline=False)
+            await log_action(self.faction, action_embed)
+
         await interaction.followup.send(f"✅ **{added_count}** Namen zu **{f_name}** hinzugefügt, `{skipped_count}` übersprungen.", ephemeral=True)
-
-class BulkAddButtonView(discord.ui.View):
-    def __init__(self, author_id: int, user_factions: list, is_owner: bool):
-        super().__init__(timeout=120)
-        self.author_id = author_id
-        faction_meta = {
-            "medic": {"label": "Mediziner", "description": "Mediziner Blacklist", "emoji": "💊"},
-            "army": {"label": "Army", "description": "Army Blacklist", "emoji": "🪖"},
-            "pd": {"label": "Police Department (PD)", "description": "Police Department Blacklist", "emoji": "🛡️"}
-        }
-        options = []
-        target_factions = ["medic", "army", "pd"] if is_owner else user_factions
-        for f in target_factions:
-            if f in faction_meta:
-                m = faction_meta[f]
-                options.append(discord.SelectOption(label=m["label"], value=f, description=m["description"], emoji=m["emoji"]))
-
-        if options:
-            self.select_item = discord.ui.Select(placeholder="Wähle die Ziel-Fraktion...", options=options)
-            self.select_item.callback = self.select_callback
-            self.add_item(self.select_item)
-
-    async def select_callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message("Das ist nicht dein Menü!", ephemeral=True)
-            return
-        await interaction.response.send_modal(BulkAddModal(self.select_item.values[0]))
-
 def build_dashboard_embed(author_name: str, author_avatar: str) -> discord.Embed:
     global PEAK_LATENCY, PREVIOUS_LATENCY
+    
     current_lat = round(bot.latency * 1000, 1)
     if current_lat > PEAK_LATENCY:
         PEAK_LATENCY = current_lat
+        
     trend_icon = "↘️" if current_lat < PREVIOUS_LATENCY else ("↗️" if current_lat > PREVIOUS_LATENCY else "➡️")
     PREVIOUS_LATENCY = current_lat
 
@@ -794,23 +714,128 @@ def build_dashboard_embed(author_name: str, author_avatar: str) -> discord.Embed
             pass
 
     bound_channels = config.get("bound_messages", [])
-    valid_channels_count = len([item for item in bound_channels if bot.get_channel(item.get("channel_id"))])
+    clean_bound_channels = []
+    valid_channels_count = 0
+    config_updated = False
+
+    for item in list(bound_channels):
+        ch_id = item.get("channel_id")
+        channel = bot.get_channel(ch_id)
+        if channel and hasattr(channel, "guild") and channel.guild:
+            valid_channels_count += 1
+            clean_bound_channels.append(item)
+        else:
+            config_updated = True
+
+    if config_updated:
+        config["bound_messages"] = clean_bound_channels
+        asyncio.create_task(save_config())
+
     ok_jsons, total_jsons = check_database_integrity()
+    db_status_str = f"🟢 {ok_jsons}/{total_jsons} JSONs OK (Schreibbar)" if ok_jsons == total_jsons else f"⚠️ {ok_jsons}/{total_jsons} JSONs lesbar"
+    
     medic_count = len([e for e in blacklists['medic'] if "canary" not in e.get("name", "").lower()])
     army_count = len([e for e in blacklists['army'] if "canary" not in e.get("name", "").lower()])
     pd_count = len([e for e in blacklists['pd'] if "canary" not in e.get("name", "").lower()])
     total_active = medic_count + army_count + pd_count
     total_archived = get_total_history_count()
+
+    last_action_ts = config.get("last_action_timestamp")
+    if last_action_ts:
+        diff_sec = int(round(time.time() - last_action_ts))
+        a_days, a_rem = divmod(diff_sec, 86400)
+        a_hours, a_rem = divmod(a_rem, 3600)
+        a_mins, a_secs = divmod(a_rem, 60)
+        time_ago = f"vor {a_days}d {a_hours}h" if a_days > 0 else (f"vor {a_hours}h {a_mins}m" if a_hours > 0 else (f"vor {a_mins}m" if a_mins > 0 else f"vor {a_secs}s"))
+        last_action_display = f"{time_ago} ({config.get('last_action')})"
+    else:
+        last_action_display = config.get('last_action')
+
+    action_logs = config.get("action_log_channels", {})
+    action_config_changed = False
+
+    def get_log_str(key):
+        nonlocal action_config_changed
+        cid = action_logs.get(key)
+        if cid:
+            ch = bot.get_channel(cid)
+            if ch:
+                return f"✅ Aktiv ({ch.mention})"
+            else:
+                action_logs[key] = None
+                action_config_changed = True
+                return "❌ Inaktiv (Gelöscht)"
+        return "❌ Inaktiv (Fehlt)"
+
+    med_log_str = get_log_str('medic')
+    army_log_str = get_log_str('army')
+    pd_log_str = get_log_str('pd')
+
+    if action_config_changed:
+        asyncio.create_task(save_config())
+
     is_locked = config.get("lockdown", False)
+    
+    if is_locked:
+        embed_color = DARK_RED
+        overall_status = "🔴 LOCKDOWN"
+    elif ok_jsons < total_jsons or current_lat > 350:
+        embed_color = discord.Color.gold()
+        overall_status = "🟡 RECHTE / LATENZ WARNUNG"
+    else:
+        embed_color = BRIGHT_GREEN
+        overall_status = "🟢 OPTIMAL"
+
+    backup_time_str = f"✅ Heute ({LAST_AUTO_BACKUP_TIME})" if LAST_AUTO_BACKUP_TIME else "✅ Aktiv (In Kürze)"
 
     embed = discord.Embed(
         title="🏓 SYSTEM CONTROL PANEL",
-        description=f"**STATUS:** `{'🔴 LOCKDOWN' if is_locked else '🟢 OPTIMAL'}`",
-        color=DARK_RED if is_locked else BRIGHT_GREEN,
+        description=f"**STATUS:** `{overall_status}` | **LOCKDOWN:** `{'🔴 AKTIV' if is_locked else '🟢 NORMAL'}`",
+        color=embed_color,
         timestamp=datetime.now()
     )
-    embed.add_field(name="⚡ NETZWERK", value=f"• Latenz: {current_lat} ms {trend_icon}\n• Uptime: {uptime_str}\n• RAM: {ram_usage_mb} MB", inline=False)
-    embed.add_field(name="📊 DATENBANK", value=f"• Medic: {medic_count} | Army: {army_count} | PD: {pd_count}\n• Archiviert: {total_archived}", inline=False)
+
+    embed.add_field(
+        name="⚡ LEISTUNG & NETZWERK",
+        value=f"```text\n"
+              f"┌ 📶 API-Latenz    : {current_lat} ms {trend_icon} (Peak: {PEAK_LATENCY} ms)\n"
+              f"├ 🌐 Gateway/WS    : 100% OK (🟢 Heartbeat aktiv)\n"
+              f"├ ⏱️ Laufzeit      : {uptime_str}\n"
+              f"└ 💾 RAM-Nutzung   : {ram_usage_mb} MB\n"
+              f"```",
+        inline=False
+    )
+
+    embed.add_field(
+        name="📊 DATENBANK & INVENTAR",
+        value=f"• <:7990blacklistedids:1546843988328316928> **Medic Blacklist:** {medic_count} Einträge\n"
+              f"• <:7990blacklistedids:1546843988328316928> **Army Blacklist:** {army_count} Einträge\n"
+              f"• <:7990blacklistedids:1546843988328316928> **PD Blacklist:** {pd_count} Einträge\n"
+              f"• 📦 **Gesamt / Archiv:** {total_active} / {total_archived} gelöscht\n"
+              f"• 💾 **DB-Integrität:** {db_status_str}\n"
+              f"• 📦 **Auto-Backup:** {backup_time_str}",
+        inline=False
+    )
+
+    embed.add_field(
+        name="🛡️ FRAKTIONS-GRADE (LOG-KANÄLE)",
+        value=f"• 💊 **Mediziner Log:** {med_log_str}\n"
+              f"• 🪖 **Army Log:** {army_log_str}\n"
+              f"• 🛡️ **PD Log:** {pd_log_str}",
+        inline=False
+    )
+
+    embed.add_field(
+        name="⚙️ MONITORING & KANÄLE",
+        value=f"```text\n"
+              f"┌ 📺 Live-Embeds     : {valid_channels_count}/{len(bound_channels)} Bereit ✅\n"
+              f"├ 🔍 Namens-Filter   : {len(keywords)} Keywords\n"
+              f"├ 🕵️ Snitch Monitor  : {'✅ Aktiv' if config.get('snitch_url') else '❌ Inaktiv'}\n"
+              f"└ ⏱️ Letzte Aktion   : {last_action_display}\n"
+              f"```",
+        inline=False
+    )
+
     embed.set_footer(text=f"Angefordert von {author_name}", icon_url=author_avatar)
     return embed
 
@@ -818,34 +843,124 @@ class PingDashboardView(discord.ui.View):
     def __init__(self, author_id: int):
         super().__init__(timeout=180)
         self.author_id = author_id
+        self.update_button_labels()
+
+    def update_button_labels(self):
+        is_locked = config.get("lockdown", False)
+        self.toggle_lockdown.label = "🔒 Lockdown (AN)" if is_locked else "🔒 Lockdown (AUS)"
+        self.toggle_lockdown.style = discord.ButtonStyle.danger if is_locked else discord.ButtonStyle.secondary
 
     @discord.ui.button(label="🔒 Lockdown", style=discord.ButtonStyle.secondary)
     async def toggle_lockdown(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != OWNER_ID:
+            await interaction.response.send_message("❌ Nur der Bot-Owner darf den Lockdown umschalten.", ephemeral=True)
+            return
+
+        current_state = config.get("lockdown", False)
+        config["lockdown"] = not current_state
+        await save_config()
+
+        await update_bound_messages()
+
+        self.update_button_labels()
+        embed = build_dashboard_embed(interaction.user.display_name, interaction.user.display_avatar.url)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="⚙️ Owner-Befehle", style=discord.ButtonStyle.danger)
+    async def owner_help_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != OWNER_ID:
+            await interaction.response.send_message("❌ Dieser Button ist nur für den Bot-Owner bestimmt.", ephemeral=True)
+            return
+
+        help_embed = discord.Embed(
+            title="🛠️ Befehlsübersicht & Berechtigungen",
+            description="Hier ist die komplette Liste aller Befehle inklusive der jeweiligen Rechte-Zuordnung:",
+            color=DARK_RED,
+            timestamp=datetime.now()
+        )
+        
+        help_embed.add_field(
+            name="⌨️ Prefix-Befehle (!)",
+            value="• `!ping` – Öffnet das Dashboard `[Owner Only]`\n"
+                  "• `!verify <ID>` – Kopierschutz-ID auswerten `[Fraktions-Admin]`\n"
+                  "• `!addm` – Massen-Eingabefenster öffnen `[Fraktions-Admin]`\n"
+                  "• `!setup_blacklist` – Live-Embed einrichten `[Fraktions-Admin]`\n"
+                  "• `!set_action_log` – Aktions-Log-Kanal setzen `[Fraktions-Admin]`\n"
+                  "• `!set_system_log` – System-Log-Kanal setzen `[Owner Only]`\n"
+                  "• `!set_snitch` – Dead Man's Snitch konfigurieren `[Owner Only]`\n"
+                  "• `!clear_history` – Archiv-Daten zurücksetzen `[Owner Only]`\n"
+                  "• `!restart` – Bot-Prozess neu starten `[Owner Only]`",
+            inline=False
+        )
+
+        help_embed.add_field(
+            name="⚡ Slash-Befehle (/)",
+            value="• `/add` – Einzelnen Spieler hinzufügen `[Fraktions-Admin]`\n"
+                  "• `/add_bulk` – Massen-Eingabefenster öffnen `[Fraktions-Admin]`\n"
+                  "• `/remove` – Spieler entfernen (4-Augen-Prinzip) `[Fraktions-Admin]`\n"
+                  "• `/check` – Blacklists durchsuchen (Master, mit Notiz & Fuzzy) `[Fraktions-Admin]`\n"
+                  "• `/alias` – Alias zu Eintrag hinzufügen `[Fraktions-Admin]`\n"
+                  "• `/history` – Archiv gelöschter Einträge ansehen `[Fraktions-Admin]`\n"
+                  "• `/open_list` – Blacklist privat anzeigen (mit Stempel) `[Fraktions-Admin]`\n"
+                  "• `/set_faction_admin` – Admin ernennen `[Owner Only]`\n"
+                  "• `/remove_faction_admin` – Admin entfernen `[Owner Only]`\n"
+                  "• `/keywords` / `/keywords_remove` – Keywords verwalten `[Fraktions-Admin / Owner]`",
+            inline=False
+        )
+        
+        help_embed.set_footer(text="Bot Owner Control Panel | Alle ! Befehle löschen sich nach 5 Min.")
+        await interaction.response.send_message(embed=help_embed, ephemeral=True)
+
+    @discord.ui.button(label="📦 Backup", style=discord.ButtonStyle.primary)
+    async def send_backup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != OWNER_ID:
             await interaction.response.send_message("❌ Nur für den Bot-Owner.", ephemeral=True)
             return
-        config["lockdown"] = not config.get("lockdown", False)
-        await save_config()
-        await update_bound_messages()
-        await interaction.response.edit_message(embed=build_dashboard_embed(interaction.user.display_name, interaction.user.display_avatar.url), view=self)
+
+        await interaction.response.defer(ephemeral=True)
+        files_to_send = []
+
+        for faction, fname in FILES.items():
+            if os.path.exists(fname):
+                files_to_send.append(discord.File(fname))
+
+        if os.path.exists(CONFIG_FILE):
+            files_to_send.append(discord.File(CONFIG_FILE))
+
+        try:
+            await interaction.user.send("📦 **Hier sind deine aktuellen Datenbank- & Konfigurations-Backups:**", files=files_to_send)
+            await interaction.followup.send("✅ Backup wurde dir per Direktnachricht (PN) zugesendet!", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Fehler beim Senden per PN: `{e}`", ephemeral=True)
+
+    @discord.ui.button(label="📢 Ankündigung", style=discord.ButtonStyle.secondary)
+    async def send_broadcast(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != OWNER_ID:
+            await interaction.response.send_message("❌ Nur für den Bot-Owner.", ephemeral=True)
+            return
+        await interaction.response.send_modal(BroadcastModal())
 
     @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.success)
     async def refresh_dashboard(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(embed=build_dashboard_embed(interaction.user.display_name, interaction.user.display_avatar.url), view=self)
+        self.update_button_labels()
+        embed = build_dashboard_embed(interaction.user.display_name, interaction.user.display_avatar.url)
+        await interaction.response.edit_message(embed=embed, view=self)
 
 class FactionSelectView(discord.ui.View):
     def __init__(self, author_id: int, callback_func, allowed_factions=None):
         super().__init__(timeout=60)
         self.author_id = author_id
         self.callback_func = callback_func
-        options = [
-            discord.SelectOption(label="Mediziner", value="medic", emoji="💊"),
-            discord.SelectOption(label="Army", value="army", emoji="🪖"),
-            discord.SelectOption(label="PD", value="pd", emoji="🛡️")
+        
+        all_options = [
+            discord.SelectOption(label="Mediziner", value="medic", description="Mediziner Lomita Blacklist", emoji="💊"),
+            discord.SelectOption(label="Army", value="army", description="Army Blacklist", emoji="🪖"),
+            discord.SelectOption(label="PD", value="pd", description="Police Department Blacklist", emoji="🛡️")
         ]
         if allowed_factions is not None:
-            options = [opt for opt in options if opt.value in allowed_factions]
-        self.select_item = discord.ui.Select(placeholder="Wähle eine Fraktion...", options=options)
+            all_options = [opt for opt in all_options if opt.value in allowed_factions]
+
+        self.select_item = discord.ui.Select(placeholder="Wähle eine Fraktion aus...", options=all_options)
         self.select_item.callback = self.select_callback
         self.add_item(self.select_item)
 
@@ -854,14 +969,117 @@ class FactionSelectView(discord.ui.View):
             await interaction.response.send_message("Das ist nicht dein Menü!", ephemeral=True)
             return
         await self.callback_func(interaction, self.select_item.values[0])
+class PublicBlacklistExpandView(discord.ui.View):
+    def __init__(self, faction: str):
+        super().__init__(timeout=None)  # Button bleibt dauerhaft aktiv
+        self.faction = faction
+
+    @discord.ui.button(label="📂 Blacklist anzeigen (30 Sec. offen)", style=discord.ButtonStyle.primary, custom_id="public_expand_blacklist_btn")
+    async def expand_blacklist(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if config.get("lockdown", False):
+            await trigger_silent_alarm(interaction, "public_expand_list")
+            await interaction.response.send_message("🔒 **SYSTEM IM LOCKDOWN:** Die Einsicht ist gesperrt.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        user_id = interaction.user.id
+        user_expand_counts[user_id] = user_expand_counts.get(user_id, 0) + 1
+        click_count = user_expand_counts[user_id]
+
+        entries = blacklists.get(self.faction, [])
+        ch_name = getattr(interaction.channel, "name", "Öffentlicher Kanal")
+        
+        # Prüfung: Ist der klickende User der Owner?
+        is_owner = (user_id == OWNER_ID)
+        
+        source_info = f"Kanal-Klick in #{ch_name} von @{interaction.user.name} (ID: {user_id})" + (" [OWNER KOPIE]" if is_owner else "")
+        
+        # is_owner_copy=is_owner blendet das Wasserzeichen bei deinem Klick aus!
+        embeds = format_blacklist_embeds(self.faction, entries, show_notes=False, source_info=source_info, is_owner_copy=is_owner)
+        
+        active_view = PublicBlacklistActiveView(self.faction, interaction.message.id)
+        
+        await interaction.message.edit(embed=embeds[0], view=active_view)
+
+        log_msg = (
+            f"👁️ **Öffentliche Blacklist aufgeklappt!**\n"
+            f"• **Nutzer:** {interaction.user.mention} (`{interaction.user.name}` | ID: `{user_id}`)\n"
+            f"• **Fraktion:** `{self.faction.upper()}` in {interaction.channel.mention}\n"
+            f"• **Modus:** {'👑 Owner-Kopie (Sauber)' if is_owner else '🛡️ Gesichert mit Wasserzeichen'}\n"
+            f"• **Häufigkeit:** Hat die Liste bisher **{click_count}x** aufgeklappt.\n"
+            f"• **Zeitfenster:** 30 Sekunden"
+        )
+        await log_system(log_msg, level="WARNING" if click_count >= 5 else "INFO")
+
+
+class PublicBlacklistActiveView(discord.ui.View):
+    def __init__(self, faction: str, message_id: int):
+        super().__init__(timeout=30)  # EXAKT 30 SEKUNDEN
+        self.faction = faction
+        self.message_id = message_id
+
+    @discord.ui.button(label="🔒 Liste jetzt schließen", style=discord.ButtonStyle.danger)
+    async def close_list(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        await self.reset_to_closed(interaction.message)
+
+    async def on_timeout(self):
+        try:
+            for item in config.get("bound_messages", []):
+                if self.message_id in item.get("message_ids", []):
+                    channel_id = item.get("channel_id")
+                    channel = bot.get_channel(channel_id)
+                    if channel:
+                        msg = await channel.fetch_message(self.message_id)
+                        await self.reset_to_closed(msg)
+                    break
+        except Exception as e:
+            logger.error(f"Fehler beim automatischen Schließen nach 30s: {e}")
+
+    async def reset_to_closed(self, message: discord.Message):
+        is_locked = config.get("lockdown", False)
+        faction_names = {"medic": "Mediziner Lomita Blacklist", "army": "Army Blacklist", "pd": "PD Blacklist"}
+        title_name = faction_names.get(self.faction, "Blacklist")
+
+        closed_embed = discord.Embed(
+            title=f"<:7990blacklistedids:1546843988328316928> {title_name}",
+            description="🔒 **SYSTEM IM LOCKDOWN**\n\n*Die Einsicht ist gesperrt.*" if is_locked else "Klicke auf den Button unten, um die aktuelle Blacklist für **30 Sekunden** für alle sichtbar im Kanal zu öffnen.\n\n*Bei jedem Aufruf wird ein neuer, eindeutiger Sicherheitscode generiert.*",
+            color=DARK_RED if is_locked else DARK_GREEN,
+            timestamp=datetime.now()
+        )
+        closed_embed.set_footer(text="🔒 Gesichertes Abrufsystem | Schließt automatisch nach 30 Sekunden")
+        
+        view = PublicBlacklistExpandView(self.faction)
+        await message.edit(embed=closed_embed, view=view)
 
 class ActionLogSelectView(discord.ui.View):
     def __init__(self, author_id: int, channel: discord.TextChannel, is_owner: bool, user_factions: list):
         super().__init__(timeout=60)
         self.author_id = author_id
         self.channel = channel
-        options = [discord.SelectOption(label=f.upper(), value=f) for f in (["medic", "army", "pd", "all"] if is_owner else user_factions)]
-        self.select_item = discord.ui.Select(placeholder="Wähle Aktions-Log Ziel...", options=options)
+        self.is_owner = is_owner
+
+        faction_meta = {
+            "medic": {"label": "Mediziner", "description": "Aktions-Log für Mediziner", "emoji": "💊"},
+            "army": {"label": "Army", "description": "Aktions-Log für Army", "emoji": "🪖"},
+            "pd": {"label": "Police Department", "description": "Aktions-Log für PD", "emoji": "🛡️"}
+        }
+
+        options = []
+        target_factions = ["medic", "army", "pd"] if is_owner else user_factions
+        for f_key in target_factions:
+            if f_key in faction_meta:
+                meta = faction_meta[f_key]
+                options.append(discord.SelectOption(label=meta["label"], value=f_key, description=meta["description"], emoji=meta["emoji"]))
+        
+        if self.is_owner:
+            options.append(discord.SelectOption(label="Alle Action-Logs (Master)", value="all", description="Sammelt sämtliche Logs an einem Ort", emoji="🌐"))
+
+        if not options:
+            options.append(discord.SelectOption(label="Keine Berechtigung", value="none"))
+
+        self.select_item = discord.ui.Select(placeholder="Wähle das Ziel für diesen Aktions-Log...", options=options)
         self.select_item.callback = self.select_callback
         self.add_item(self.select_item)
 
@@ -869,18 +1087,48 @@ class ActionLogSelectView(discord.ui.View):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message("Das ist nicht dein Menü!", ephemeral=True)
             return
-        val = self.select_item.values[0]
-        config["action_log_channels"][val] = self.channel.id
-        await save_config()
-        await interaction.response.edit_message(content=f"✅ Aktions-Log für `{val}` gesetzt.", view=None)
 
+        selected_val = self.select_item.values[0]
+        if selected_val == "none":
+            await interaction.response.edit_message(content="❌ Keine Berechtigung.", view=None)
+            return
+        if selected_val == "all" and not self.is_owner:
+            await interaction.response.edit_message(content="❌ Nur der Bot-Owner kann den Master-Kanal setzen.", view=None)
+            return
+
+        if "action_log_channels" not in config:
+            config["action_log_channels"] = {"medic": None, "army": None, "pd": None, "all": None}
+
+        config["action_log_channels"][selected_val] = self.channel.id
+        await save_config()
+
+        label_name = "Alle Action-Logs (Master)" if selected_val == "all" else selected_val.upper()
+        await interaction.response.edit_message(content=f"✅ Aktions-Log für **{label_name}** auf {self.channel.mention} gesetzt.", view=None)
+        await log_system(f"⚙️ **Aktions-Log gesetzt:** `{label_name}` in {self.channel.mention} durch {interaction.user.mention}.")
 class SetupBlacklistSelectView(discord.ui.View):
     def __init__(self, author_id: int, channel: discord.TextChannel, is_owner: bool, user_factions: list):
         super().__init__(timeout=60)
         self.author_id = author_id
         self.channel = channel
-        options = [discord.SelectOption(label=f.upper(), value=f) for f in (["medic", "army", "pd"] if is_owner else user_factions)]
-        self.select_item = discord.ui.Select(placeholder="Wähle Blacklist Fraktion...", options=options)
+        self.is_owner = is_owner
+
+        faction_meta = {
+            "medic": {"label": "Mediziner", "description": "Live-Blacklist für Mediziner", "emoji": "💊"},
+            "army": {"label": "Army", "description": "Live-Blacklist für Army", "emoji": "🪖"},
+            "pd": {"label": "Police Department", "description": "Live-Blacklist für PD", "emoji": "🛡️"}
+        }
+
+        options = []
+        target_factions = ["medic", "army", "pd"] if is_owner else user_factions
+        for f_key in target_factions:
+            if f_key in faction_meta:
+                meta = faction_meta[f_key]
+                options.append(discord.SelectOption(label=meta["label"], value=f_key, description=meta["description"], emoji=meta["emoji"]))
+
+        if not options:
+            options.append(discord.SelectOption(label="Keine Berechtigung", value="none"))
+
+        self.select_item = discord.ui.Select(placeholder="Wähle die Fraktion für dieses Blacklist-Embed...", options=options)
         self.select_item.callback = self.select_callback
         self.add_item(self.select_item)
 
@@ -888,36 +1136,93 @@ class SetupBlacklistSelectView(discord.ui.View):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message("Das ist nicht dein Menü!", ephemeral=True)
             return
+
         faction = self.select_item.values[0]
+        if faction == "none":
+            await interaction.response.edit_message(content="❌ Keine Berechtigung.", view=None)
+            return
+
         is_locked = config.get("lockdown", False)
-        closed_embed = discord.Embed(title="Mediziner Lomita Blacklist", description="Klicke auf den Button, um die Blacklist für 30 Sekunden zu öffnen.", color=DARK_GREEN)
-        msg = await self.channel.send(embed=closed_embed, view=PublicBlacklistExpandView(faction))
+        faction_names = {"medic": "Mediziner Lomita Blacklist", "army": "Army Blacklist", "pd": "PD Blacklist"}
+        title_name = faction_names.get(faction, "Blacklist")
+
+        closed_embed = discord.Embed(
+            title=f"<:7990blacklistedids:1546843988328316928> {title_name}",
+            description="🔒 **SYSTEM IM LOCKDOWN**\n\n*Die Einsicht ist gesperrt.*" if is_locked else "Klicke auf den Button unten, um die aktuelle Blacklist für **30 Sekunden** für alle sichtbar im Kanal zu öffnen.\n\n*Bei jedem Aufruf wird ein neuer, eindeutiger Sicherheitscode generiert.*",
+            color=DARK_RED if is_locked else DARK_GREEN,
+            timestamp=datetime.now()
+        )
+        closed_embed.set_footer(text="🔒 Gesichertes Abrufsystem | Schließt automatisch nach 30 Sekunden")
+
+        view = PublicBlacklistExpandView(faction)
+        msg = await self.channel.send(embed=closed_embed, view=view)
+
+        config["bound_messages"] = [b for b in config["bound_messages"] if not (b.get("channel_id") == self.channel.id and b.get("faction") == faction)]
         config["bound_messages"].append({"channel_id": self.channel.id, "faction": faction, "message_ids": [msg.id]})
         await save_config()
-        await interaction.response.edit_message(content=f"✅ Setup für `{faction}` abgeschlossen.", view=None)
 
-class SnitchModal(discord.ui.Modal, title="Snitch URL"):
-    url_input = discord.ui.TextInput(label="URL", style=discord.TextStyle.short, required=True)
+        await interaction.response.edit_message(content=f"✅ **{faction.upper()}**-Blacklist in {self.channel.mention} eingerichtet!", view=None)
+        await log_system(f"⚙️ **Setup:** {faction.upper()} in {self.channel.mention} durch {interaction.user.mention}.")
+
+class SnitchModal(discord.ui.Modal, title="Dead Man's Snitch URL konfigurieren"):
+    url_input = discord.ui.TextInput(
+        label="Snitch URL",
+        placeholder="https://nosnitch.me/dein-token",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=500
+    )
+
     async def on_submit(self, interaction: discord.Interaction):
-        config["snitch_url"] = self.url_input.value.strip()
+        if interaction.user.id != OWNER_ID:
+            await interaction.response.send_message("❌ Nur für den Bot-Owner.", ephemeral=True)
+            return
+
+        cleaned_url = re.sub(r'[<>\s]', '', self.url_input.value.strip())
+        config["snitch_url"] = cleaned_url
         await save_config()
-        await interaction.response.send_message("✅ Snitch URL gespeichert.", ephemeral=True)
+
+        await interaction.response.send_message(f"✅ Snitch URL gespeichert: `{cleaned_url}`", ephemeral=True)
+        await log_system(f"⚙️ **Snitch URL aktualisiert** durch {interaction.user.mention}.")
 
 class SnitchButtonView(discord.ui.View):
     def __init__(self, author_id: int):
         super().__init__(timeout=60)
         self.author_id = author_id
-    @discord.ui.button(label="URL eingeben", style=discord.ButtonStyle.green)
-    async def btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+    @discord.ui.button(label="🔗 Snitch URL eingeben", style=discord.ButtonStyle.green)
+    async def open_modal_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Das ist nicht dein Menü!", ephemeral=True)
+            return
         await interaction.response.send_modal(SnitchModal())
 
 class RemoveAdminView(discord.ui.View):
     def __init__(self, faction: str, admins: list, guild: discord.Guild):
         super().__init__(timeout=60)
-        options = [discord.SelectOption(label=str(uid), value=str(uid)) for uid in admins] or [discord.SelectOption(label="Keine", value="none")]
-        self.select_item = discord.ui.Select(placeholder="Admin entfernen...", options=options)
+        options = []
+        for uid in admins:
+            member = guild.get_member(uid) if guild else None
+            display_name = member.display_name if member else f"User ID: {uid}"
+            options.append(discord.SelectOption(label=display_name, value=str(uid), description=f"ID: {uid}"))
+        if not options:
+            options.append(discord.SelectOption(label="Keine Admins vorhanden", value="none"))
+            
+        self.select_item = discord.ui.Select(placeholder=f"Wähle Admin für {faction.upper()} zum Entfernen...", options=options)
+        self.select_item.callback = self.select_callback
         self.faction = faction
         self.add_item(self.select_item)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        if self.select_item.values[0] == "none":
+            await interaction.response.edit_message(content="Keine Admins zum Entfernen vorhanden.", view=None)
+            return
+        uid_to_remove = int(self.select_item.values[0])
+        if uid_to_remove in config["faction_admins"][self.faction]:
+            config["faction_admins"][self.faction].remove(uid_to_remove)
+            await save_config()
+            await interaction.response.edit_message(content=f"✅ Admin ID `{uid_to_remove}` von **{self.faction.upper()}** entfernt.", view=None)
+            await log_system(f"⚙️ **Admin entfernt:** ID `{uid_to_remove}` für `{self.faction.upper()}`.")
 
 class HistoryPaginatorView(discord.ui.View):
     def __init__(self, history_data: list, faction: str):
@@ -925,176 +1230,743 @@ class HistoryPaginatorView(discord.ui.View):
         self.history_data = history_data
         self.faction = faction
         self.current_page = 0
+        self.per_page = 5
+        self.max_pages = max(1, (len(history_data) + self.per_page - 1) // self.per_page)
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.prev_button.disabled = self.current_page == 0
+        self.next_button.disabled = self.current_page >= self.max_pages - 1
+
     def build_embed(self) -> discord.Embed:
-        return discord.Embed(title=f"Archiv: {self.faction.upper()}", description=str(len(self.history_data)) + " Einträge", color=DARK_RED)
+        start = self.current_page * self.per_page
+        end = start + self.per_page
+        page_entries = self.history_data[start:end]
+
+        description = ""
+        for entry in page_entries:
+            name = entry.get("name", "Unbekannt")
+            removed_by = entry.get("removed_by", "Unbekannt")
+            removed_at = entry.get("removed_at", "Unbekannt")
+            note = entry.get("note")
+            
+            description += f"• **{name}**\n  └ *Gelöscht von:* {removed_by} am `{removed_at}`\n"
+            if note:
+                description += f"  └ *Notiz:* `{note}`\n"
+            description += "\n"
+
+        embed = discord.Embed(
+            title=f"📁 Archiv: {self.faction.upper()}",
+            description=description or "Keine Einträge auf dieser Seite.",
+            color=DARK_RED,
+            timestamp=datetime.now()
+        )
+        embed.set_footer(text=f"Seite {self.current_page + 1} von {self.max_pages} | Gesamteinträge: {len(self.history_data)}")
+        return embed
+
+    @discord.ui.button(label="◀ Zurück", style=discord.ButtonStyle.blurple)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        else:
+            await interaction.response.defer()
+
+    @discord.ui.button(label="Weiter ▶", style=discord.ButtonStyle.blurple)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page < self.max_pages - 1:
+            self.current_page += 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        else:
+            await interaction.response.defer()
 
 class BlacklistPaginatorView(discord.ui.View):
     def __init__(self, embeds_list: list, author_id: int, faction: str, entries_list: list):
         super().__init__(timeout=180)
         self.embeds_list = embeds_list
         self.author_id = author_id
+        self.faction = faction
+        self.entries_list = entries_list
+        self.current_page = 0
+        self.max_pages = len(embeds_list)
+        self.update_buttons()
 
-# --- SLASH BEFEHLE ---
-@bot.tree.command(name="check", description="Durchsucht alle Blacklists.")
+    def update_buttons(self):
+        self.prev_button.disabled = self.current_page == 0
+        self.next_button.disabled = self.current_page >= self.max_pages - 1
+
+    @discord.ui.button(label="◀ Zurück", style=discord.ButtonStyle.blurple)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Das ist nicht dein Menü!", ephemeral=True)
+            return
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.embeds_list[self.current_page], view=self)
+        else:
+            await interaction.response.defer()
+
+    @discord.ui.button(label="Weiter ▶", style=discord.ButtonStyle.blurple)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Das ist nicht dein Menü!", ephemeral=True)
+            return
+        if self.current_page < self.max_pages - 1:
+            self.current_page += 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.embeds_list[self.current_page], view=self)
+        else:
+            await interaction.response.defer()
+@bot.tree.command(name="check", description="Durchsucht alle Fraktions-Blacklists gleichzeitig (mit Notiz & Fuzzy-Suche).")
+@app_commands.describe(name="Der zu prüfende Name oder Teilname")
 async def slash_check(interaction: discord.Interaction, name: str):
-    await interaction.response.send_message(f"Suche nach: {name}", ephemeral=True)
+    if config.get("lockdown", False):
+        await trigger_silent_alarm(interaction, "check")
+        await interaction.response.send_message("🔒 **System Lockdown:** Alle Abfragen sind gesperrt.", ephemeral=True)
+        return
 
-@bot.tree.command(name="open_list", description="Zeigt Blacklist privat an.")
+    if not get_user_factions(interaction.user) and interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ Nur für Fraktions-Admins und den Owner.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    check_target = name.strip().lower()
+
+    if "canary" in check_target or "honeypot" in check_target:
+        config["lockdown"] = True
+        await save_config()
+        await update_bound_messages()
+        await log_system(f"🚨 **HONEYPOT AUSGELÖST!** Admin {interaction.user.mention} hat das Canary-Token abgefragt! Bot im automatischen Lockdown.", level="ERROR")
+        await interaction.followup.send("❌ Ungültiger Suchbegriff.", ephemeral=True)
+        return
+
+    found_results = []
+    all_names_for_fuzzy = []
+
+    for faction, entries in blacklists.items():
+        for entry in entries:
+            if "canary" in entry.get("name", "").lower():
+                continue
+            m_name = entry.get("name", "")
+            all_names_for_fuzzy.append(m_name)
+            aliases = [a.lower() for a in entry.get("aliases", [])]
+            note = entry.get("note")
+            
+            if check_target == m_name.lower() or check_target in aliases or check_target in m_name.lower():
+                found_results.append((faction.upper(), m_name, note))
+
+    if not found_results:
+        close_matches = get_close_matches(name, all_names_for_fuzzy, n=3, cutoff=0.6)
+        desc = "Der Begriff wurde in keiner Liste gefunden."
+        if close_matches:
+            desc += f"\n\n🔍 **Meintest du vielleicht:**\n• " + "\n• ".join(close_matches)
+        embed = discord.Embed(title="✅ Kein direkter Treffer", description=desc, color=BRIGHT_GREEN)
+    else:
+        desc = ""
+        for fac, m_name, note in found_results:
+            desc += f"• **Fraktion:** `{fac}`\n  └ **Name:** `{m_name}`\n"
+            if note:
+                desc += f"  └ 📝 **Notiz:** `{note}`\n"
+            desc += "\n"
+        embed = discord.Embed(title="<:7990blacklistedids:1546843988328316928> TREFFER: Spieler gelistet!", description=desc, color=DARK_RED)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="open_list", description="Zeigt dir eine Blacklist deiner Wahl privat an (mit Notizen & Kopierschutz-Stempel).")
 async def slash_open_list(interaction: discord.Interaction):
+    if config.get("lockdown", False):
+        await trigger_silent_alarm(interaction, "open_list")
+        await interaction.response.send_message("🔒 System im Lockdown.", ephemeral=True)
+        return
+
     user_factions = get_user_factions(interaction.user)
+    if not user_factions and interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ Nur für Fraktions-Admins und den Owner.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    
     async def callback(inter, faction):
         entries = [e for e in blacklists.get(faction, []) if "canary" not in e.get("name", "").lower()]
-        embeds = format_blacklist_embeds(faction, entries, show_notes=True, source_info=f"Privat von {inter.user.name}", is_owner_copy=True)
-        await inter.response.edit_message(content=f"**{faction.upper()} Blacklist:**", embed=embeds[0], view=None)
-    view = FactionSelectView(interaction.user.id, callback, allowed_factions=user_factions)
-    await interaction.response.send_message("Wähle Fraktion:", view=view, ephemeral=True)
+        watermark = int(time.time()) % 100000
+        await log_system(f"🕵️‍♂️ **Audit:** {inter.user.mention} hat `{faction.upper()}` eingesehen (Stempel: #{watermark}).", level="WARNING")
 
-@bot.tree.command(name="add", description="Fügt einen Namen hinzu.")
+        if not entries:
+            await inter.response.edit_message(content=f"Die Blacklist für **{faction.upper()}** ist leer.", embed=None, view=None)
+            return
+        
+        embeds = format_blacklist_embeds(faction, entries, show_notes=True, source_info=f"Privat-Audit von {inter.user.display_name}", is_owner_copy=True)
+        if len(embeds) == 1:
+            await inter.response.edit_message(content=f"<:7990blacklistedids:1546843988328316928> **{faction.upper()} Blacklist (Gesichert):**", view=None)
+            await inter.followup.send(embed=embeds[0], ephemeral=True)
+        else:
+            paginator = BlacklistPaginatorView(embeds, inter.user.id, faction, entries)
+            await inter.response.edit_message(content=f"<:7990blacklistedids:1546843988328316928> **{faction.upper()} Blacklist (Seite 1/{len(embeds)}):**", embed=embeds[0], view=paginator)
+
+    view = FactionSelectView(interaction.user.id, callback, allowed_factions=user_factions)
+    await interaction.followup.send("Wähle die Fraktion aus:", view=view, ephemeral=True)
+
+@bot.tree.command(name="add", description="Fügt einen Namen zu einer Fraktions-Blacklist hinzu.")
+@app_commands.describe(faction="Wähle die Ziel-Fraktion", name="Vor- und Nachname des Spielers (mit optionalem Grund)")
+@app_commands.choices(faction=[
+    app_commands.Choice(name="Mediziner", value="medic"),
+    app_commands.Choice(name="Army", value="army"),
+    app_commands.Choice(name="Police Department", value="pd")
+])
 async def slash_add(interaction: discord.Interaction, faction: str, name: str):
+    if config.get("lockdown", False):
+        await trigger_silent_alarm(interaction, "add")
+        await interaction.response.send_message("🔒 **System Lockdown:** Das Hinzufügen von Einträgen ist aktuell gesperrt.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
     if not check_faction_permission(interaction.user, faction):
-        await interaction.response.send_message("❌ Keine Rechte.", ephemeral=True)
+        await interaction.followup.send(f"❌ Du hast keine Rechte als **{faction.upper()}**-Admin!", ephemeral=True)
         return
-    cleaned, note, err = validate_and_clean_name(name)
-    if err:
-        await interaction.response.send_message(f"❌ {err}", ephemeral=True)
+
+    cleaned, note, error_msg = validate_and_clean_name(name)
+    if error_msg:
+        await interaction.followup.send(f"❌ **Fehler:** {error_msg}", ephemeral=True)
         return
-    blacklists[faction].append({"name": cleaned, "aliases": [], "note": note})
+
+    entries = blacklists[faction]
+    if any(e.get("name", "").lower() == cleaned.lower() for e in entries):
+        await interaction.followup.send(f"⚠️ **{cleaned}** steht bereits auf der {faction.upper()}-Blacklist.", ephemeral=True)
+        return
+
+    new_entry = {"name": cleaned, "aliases": [], "note": note}
+    entries.append(new_entry)
     await save_data(faction)
     await update_bound_messages(faction)
-    await interaction.response.send_message(f"✅ {cleaned} hinzugefügt.", ephemeral=True)
 
-@bot.tree.command(name="remove", description="Entfernt einen Namen (4-Augen-Prinzip).")
+    config["last_action"] = f"➕ `{cleaned}` zu {faction.upper()} ({interaction.user.display_name})"
+    config["last_action_timestamp"] = time.time()
+    await save_config()
+
+    action_embed = discord.Embed(title=f"➕ [{faction.upper()}] Hinzugefügt", color=BRIGHT_GREEN, timestamp=datetime.now())
+    action_embed.add_field(name="Name", value=cleaned, inline=True)
+    if note:
+        action_embed.add_field(name="Notiz", value=f"`{note}`", inline=False)
+    action_embed.add_field(name="Von", value=interaction.user.mention, inline=False)
+    
+    await log_action(faction, action_embed)
+    await interaction.followup.send(f"✅ **{cleaned}** wurde zur **{faction.upper()}** hinzugefügt.", ephemeral=True)
+
+@bot.tree.command(name="remove", description="Entfernt einen Namen (erfordert das 4-Augen-Prinzip).")
+@app_commands.describe(faction="Wähle die Fraktion", name="Name des Spielers")
+@app_commands.choices(faction=[
+    app_commands.Choice(name="Mediziner", value="medic"),
+    app_commands.Choice(name="Army", value="army"),
+    app_commands.Choice(name="Police Department", value="pd")
+])
 async def slash_remove(interaction: discord.Interaction, faction: str, name: str):
+    if config.get("lockdown", False):
+        await trigger_silent_alarm(interaction, "remove")
+        await interaction.response.send_message("🔒 **System Lockdown:** Das Entfernen von Einträgen ist aktuell gesperrt.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
     if not check_faction_permission(interaction.user, faction):
-        await interaction.response.send_message("❌ Keine Rechte.", ephemeral=True)
+        await interaction.followup.send(f"❌ Du hast keine Rechte als **{faction.upper()}**-Admin!", ephemeral=True)
         return
+
+    u_id = interaction.user.id
+    now = time.time()
+    
+    if u_id not in removal_attempts:
+        removal_attempts[u_id] = []
+    
+    removal_attempts[u_id] = [t for t in removal_attempts[u_id] if now - t < 60]
+    removal_attempts[u_id].append(now)
+
+    if len(removal_attempts[u_id]) >= 3:
+        config["lockdown"] = True
+        await save_config()
+        await update_bound_messages()
+        
+        alarm_msg = (
+            f"🚨 **AUTOMATISCHER LOCKDOWN (Massen-Löschversuch!):**\n"
+            f"• **Admin:** {interaction.user.mention} (`{interaction.user.name}` | ID: `{u_id}`)\n"
+            f"• **Grund:** 3 Lösch-Anfragen innerhalb von 60 Sekunden.\n"
+            f"• **Aktion:** Das System wurde sofort gesperrt."
+        )
+        await log_system(alarm_msg, level="ERROR")
+        await interaction.followup.send("🚨 **Sicherheits-Alarm:** Zu viele Lösch-Anfragen in kurzer Zeit. System im Lockdown!", ephemeral=True)
+        return
+
     cleaned, _, _ = validate_and_clean_name(name)
-    target = (cleaned if cleaned else name).lower()
-    entry = next((e for e in blacklists[faction] if e.get("name", "").lower() == target), None)
-    if not entry:
-        await interaction.response.send_message("⚠️ Nicht gefunden.", ephemeral=True)
+    target_name = (cleaned if cleaned else name.strip()).lower()
+    
+    entries = blacklists[faction]
+    entry_to_remove = next((e for e in entries if e.get("name", "").lower() == target_name or target_name in [a.lower() for a in e.get("aliases", [])]), None)
+    
+    if not entry_to_remove:
+        await interaction.followup.send(f"⚠️ **{name}** nicht gefunden.", ephemeral=True)
         return
-    view = RemoveApprovalView(str(time.time()), faction, entry, interaction.user.id)
-    await interaction.channel.send(embed=discord.Embed(title="Lösch-Anfrage", description=f"Freigabe für **{entry.get('name')}** nötig."), view=view)
-    await interaction.response.send_message("✅ Anfrage gesendet.", ephemeral=True)
 
-@bot.tree.command(name="history", description="Zeigt das Archiv an.")
+    req_id = str(time.time())
+    view = RemoveApprovalView(req_id, faction, entry_to_remove, interaction.user.id)
+    
+    channels = config.get("action_log_channels", {})
+    log_ch_id = channels.get(faction) or channels.get("all")
+    ch = bot.get_channel(log_ch_id) if log_ch_id else interaction.channel
+
+    embed = discord.Embed(title="🛡️ 4-Augen-Prinzip: Lösch-Anfrage", description=f"Admin {interaction.user.mention} möchte **{entry_to_remove.get('name')}** aus `{faction.upper()}` löschen.\n\n*Ein zweiter Admin muss zustimmen!*", color=discord.Color.gold())
+    try:
+        await ch.send(embed=embed, view=view)
+    except Exception:
+        pass
+
+    await interaction.followup.send("✅ Lösch-Anfrage wurde in den Admin-Log gesendet (wartet auf 2. Admin).", ephemeral=True)
+
+@bot.tree.command(name="history", description="Zeigt das komplette Archiv deiner Fraktion an.")
 async def slash_history(interaction: discord.Interaction):
-    await interaction.response.send_message("Archiv-Funktion aktiv.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    user_factions = get_user_factions(interaction.user)
+    if not user_factions:
+        await interaction.followup.send("❌ Du besitzt keine Fraktions-Admin-Rechte für Archive.", ephemeral=True)
+        return
 
-@bot.tree.command(name="alias", description="Fügt einen Alias hinzu.")
+    if len(user_factions) == 1:
+        await send_history_paginated(interaction, user_factions[0])
+    else:
+        async def callback(inter, faction):
+            await send_history_paginated(inter, faction, edit=True)
+        view = FactionSelectView(interaction.user.id, callback, allowed_factions=user_factions)
+        await interaction.followup.send("Wähle die Fraktion für das Archiv:", view=view, ephemeral=True)
+
+async def send_history_paginated(interaction: discord.Interaction, faction: str, edit: bool = False):
+    history_file = os.path.join(HISTORY_DIR, f"history_{faction}.json")
+    if not os.path.exists(history_file):
+        msg = f"📁 Archiv für **{faction.upper()}** ist leer."
+        if edit:
+            await interaction.response.edit_message(content=msg, embed=None, view=None)
+        else:
+            await interaction.followup.send(msg, ephemeral=True)
+        return
+        
+    try:
+        with open(history_file, "r", encoding="utf-8") as f:
+            history_data = json.load(f)
+    except Exception as e:
+        msg = f"❌ Fehler beim Lesen: `{e}`"
+        if edit:
+            await interaction.response.edit_message(content=msg, embed=None, view=None)
+        else:
+            await interaction.followup.send(msg, ephemeral=True)
+        return
+        
+    if not history_data:
+        msg = f"📁 Archiv für **{faction.upper()}** ist leer."
+        if edit:
+            await interaction.response.edit_message(content=msg, embed=None, view=None)
+        else:
+            await interaction.followup.send(msg, ephemeral=True)
+        return
+
+    paginator = HistoryPaginatorView(history_data[::-1], faction)
+    embed = paginator.build_embed()
+    if edit:
+        await interaction.response.edit_message(content=None, embed=embed, view=paginator)
+    else:
+        await interaction.followup.send(embed=embed, view=paginator, ephemeral=True)
+
+@bot.tree.command(name="alias", description="Fügt einem Eintrag einen Alias hinzu.")
+@app_commands.describe(faction="Wähle die Fraktion", target_name="Aktueller Hauptname", alias_name="Neuer Alias")
+@app_commands.choices(faction=[
+    app_commands.Choice(name="Mediziner", value="medic"),
+    app_commands.Choice(name="Army", value="army"),
+    app_commands.Choice(name="Police Department", value="pd")
+])
 async def slash_alias(interaction: discord.Interaction, faction: str, target_name: str, alias_name: str):
-    await interaction.response.send_message("Alias hinzugefügt.", ephemeral=True)
+    if config.get("lockdown", False):
+        await trigger_silent_alarm(interaction, "alias")
+        await interaction.response.send_message("🔒 **System Lockdown:** Das Hinzufügen von Aliases ist gesperrt.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    if not check_faction_permission(interaction.user, faction):
+        await interaction.followup.send(f"❌ Du hast keine Rechte als **{faction.upper()}**-Admin!", ephemeral=True)
+        return
+
+    cleaned_alias, _, err = validate_and_clean_name(alias_name)
+    if err:
+        await interaction.followup.send(f"❌ Ungültiger Alias: {err}", ephemeral=True)
+        return
+
+    entries = blacklists[faction]
+    alias_lower = cleaned_alias.lower()
+    for entry in entries:
+        if entry.get("name", "").lower() == alias_lower or alias_lower in [a.lower() for a in entry.get("aliases", [])]:
+            await interaction.followup.send(f"⚠️ Der Name/Alias **{cleaned_alias}** existiert bereits in dieser Blacklist!", ephemeral=True)
+            return
+
+    target_entry = next((e for e in entries if e.get("name", "").lower() == target_name.strip().lower()), None)
+    if not target_entry:
+        await interaction.followup.send(f"⚠️ Hauptname **{target_name}** nicht gefunden.", ephemeral=True)
+        return
+
+    if "aliases" not in target_entry:
+        target_entry["aliases"] = []
+
+    target_entry["aliases"].append(cleaned_alias)
+    await save_data(faction)
+    await update_bound_messages(faction)
+
+    config["last_action"] = f"🏷️ Alias `{cleaned_alias}` für `{target_entry['name']}` ({faction.upper()})"
+    config["last_action_timestamp"] = time.time()
+    await save_config()
+
+    await interaction.followup.send(f"✅ Alias **{cleaned_alias}** zu **{target_entry['name']}** hinzugefügt.", ephemeral=True)
+    await log_system(f"ℹ️ **Alias hinzugefügt** für `{target_entry['name']}` ({faction.upper()}): `{cleaned_alias}`")
 
 @bot.tree.command(name="keywords", description="Fügt ein Filter-Keyword hinzu.")
+@app_commands.describe(keyword="Das hinzuzufügende Keyword")
 async def slash_keywords(interaction: discord.Interaction, keyword: str):
-    keywords.append(keyword.strip())
-    await save_keywords()
-    await interaction.response.send_message(f"✅ Keyword `{keyword}` gespeichert.", ephemeral=True)
-
-@bot.tree.command(name="keywords_remove", description="Entfernt ein Keyword.")
-async def slash_keywords_remove(interaction: discord.Interaction, keyword: str):
-    if keyword in keywords:
-        keywords.remove(keyword)
+    if not get_user_factions(interaction.user) and interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ Keine Berechtigung.", ephemeral=True)
+        return
+    kw = keyword.strip()
+    if kw not in keywords:
+        keywords.append(kw)
         await save_keywords()
-    await interaction.response.send_message(f"✅ Keyword entfernt.", ephemeral=True)
+    await interaction.response.send_message(f"✅ Keyword `{kw}` hinzugefügt.", ephemeral=True)
 
-@bot.tree.command(name="set_faction_admin", description="[Owner] Setzt einen Admin.")
+@bot.tree.command(name="keywords_remove", description="Entfernt ein Filter-Keyword.")
+@app_commands.describe(keyword="Das zu entfernende Keyword")
+async def slash_keywords_remove(interaction: discord.Interaction, keyword: str):
+    if not get_user_factions(interaction.user) and interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ Keine Berechtigung.", ephemeral=True)
+        return
+    kw = keyword.strip()
+    if kw in keywords:
+        keywords.remove(kw)
+        await save_keywords()
+    await interaction.response.send_message(f"✅ Keyword `{kw}` entfernt.", ephemeral=True)
+
+@bot.tree.command(name="set_faction_admin", description="[Owner Only] Fügt einen Admin für eine Fraktion hinzu.")
+@app_commands.describe(faction="Die Fraktion", user="Der Nutzer")
+@app_commands.choices(faction=[
+    app_commands.Choice(name="Mediziner", value="medic"),
+    app_commands.Choice(name="Army", value="army"),
+    app_commands.Choice(name="Police Department", value="pd")
+])
+@app_commands.default_permissions(administrator=True)
 async def slash_set_faction_admin(interaction: discord.Interaction, faction: str, user: discord.Member):
     if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("❌ Nur für den Owner.", ephemeral=True)
+        await interaction.response.send_message("❌ Nur für den Bot-Owner.", ephemeral=True)
         return
-    config["faction_admins"][faction].append(user.id)
-    await save_config()
-    await interaction.response.send_message(f"✅ {user.mention} als Admin eingetragen.", ephemeral=True)
 
-@bot.tree.command(name="remove_faction_admin", description="[Owner] Entfernt einen Admin.")
+    if user.id not in config["faction_admins"][faction]:
+        config["faction_admins"][faction].append(user.id)
+        await save_config()
+
+    await interaction.response.send_message(f"✅ {user.mention} als Admin für **{faction.upper()}** eingetragen.", ephemeral=True)
+    await log_system(f"⚙️ **Admin ernannt:** {user.mention} für `{faction.upper()}`.")
+
+@bot.tree.command(name="remove_faction_admin", description="[Owner Only] Entfernt einen Admin.")
+@app_commands.describe(faction="Die Fraktion")
+@app_commands.choices(faction=[
+    app_commands.Choice(name="Mediziner", value="medic"),
+    app_commands.Choice(name="Army", value="army"),
+    app_commands.Choice(name="Police Department", value="pd")
+])
+@app_commands.default_permissions(administrator=True)
 async def slash_remove_faction_admin(interaction: discord.Interaction, faction: str):
     if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("❌ Nur für den Owner.", ephemeral=True)
+        await interaction.response.send_message("❌ Nur für den Bot-Owner.", ephemeral=True)
         return
-    await interaction.response.send_message("Admin-Verwaltung aktiv.", ephemeral=True)
 
-# --- PREFIX BEFEHLE (!) ---
-@bot.command(name="verify")
+    admins = config.get("faction_admins", {}).get(faction, [])
+    if not admins:
+        await interaction.response.send_message(f"⚠️ Keine Admins für **{faction.upper()}**.", ephemeral=True)
+        return
+
+    view = RemoveAdminView(faction, admins, interaction.guild)
+    await interaction.response.send_message("Wähle den zu entfernenden Admin:", view=view, ephemeral=True)
+@bot.command(name="verify", description="Wertet eine Kopierschutz-ID aus (z.B. !verify 64108).")
 async def cmd_verify(ctx, watermark_id: str = None):
     if not watermark_id:
+        msg = await ctx.send("❌ Bitte gib eine ID an, z.B.: `!verify 64108`")
+        await asyncio.sleep(5)
+        try:
+            await msg.delete()
+            await ctx.message.delete()
+        except Exception:
+            pass
         return
-    clean_id = watermark_id.replace("#", "").strip()
+
+    if not get_user_factions(ctx.author) and ctx.author.id != OWNER_ID:
+        msg = await ctx.send("❌ Nur für Berechtigte und den Owner.")
+        await asyncio.sleep(5)
+        try:
+            await msg.delete()
+            await ctx.message.delete()
+        except Exception:
+            pass
+        return
+
+    clean_id = watermark_id.replace("#", "").replace("<", "").replace(">", "").strip()
+    
     if clean_id in watermark_database:
         info = watermark_database[clean_id]
-        embed = discord.Embed(title=f"Auswertung: #{clean_id}", description=f"✅ Gültig!\n• Fraktion: {info.get('faction')}\n• Erstellt von/am: {info.get('source')}", color=BRIGHT_GREEN)
+        embed = discord.Embed(
+            title=f"🔍 Kopierschutz-Auswertung: #{clean_id}",
+            description=f"**Status:** ✅ Gültiges und registriertes Wasserzeichen!\n\n"
+                        f"• **Bereich:** `{info.get('faction')}`\n"
+                        f"• **Erstellt am:** `{info.get('created_at')}`\n"
+                        f"• **Quelle / Ursprung:** `{info.get('source')}`\n"
+                        f"• **Einträge zum Zeitpunkt:** `{info.get('entries_count')}`",
+            color=BRIGHT_GREEN,
+            timestamp=datetime.now()
+        )
     else:
-        embed = discord.Embed(title=f"Auswertung: #{clean_id}", description="❌ Unbekannte oder gefälschte ID!", color=DARK_RED)
-    await ctx.send(embed=embed)
+        embed = discord.Embed(
+            title=f"🔍 Kopierschutz-Auswertung: #{clean_id}",
+            description=f"**Status:** ❌ **Unbekannte oder gefälschte ID!**\n\n"
+                        f"Dieses Wasserzeichen wurde in der Datenbank nicht gefunden. Es handelt sich hierbei höchstwahrscheinlich um einen alten oder manipulierten Screenshot.",
+            color=DARK_RED,
+            timestamp=datetime.now()
+        )
 
-@bot.command(name="ping")
+    msg = await ctx.send(embed=embed)
+    await asyncio.sleep(300)
+    try:
+        await msg.delete()
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+@bot.command(name="ping", description="Zeigt das Bot-Status Dashboard (Nur für den Owner).")
 async def cmd_ping(ctx):
     if ctx.author.id != OWNER_ID:
+        msg = await ctx.send("❌ Dieser Befehl ist nur für den Bot-Owner bestimmt.")
+        await asyncio.sleep(5)
+        try:
+            await msg.delete()
+            await ctx.message.delete()
+        except Exception:
+            pass
         return
-    embed = build_dashboard_embed(ctx.author.display_name, ctx.author.display_avatar.url)
-    await ctx.send(embed=embed, view=PingDashboardView(ctx.author.id))
 
-@bot.command(name="addm", aliases=["add_bulk"])
+    embed = build_dashboard_embed(ctx.author.display_name, ctx.author.display_avatar.url)
+    view = PingDashboardView(ctx.author.id)
+    msg = await ctx.send(embed=embed, view=view)
+    
+    await asyncio.sleep(300)
+    try:
+        await msg.delete()
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+@bot.command(name="addm", aliases=["add_bulk"], description="Öffnet das Auswahlmenü für das Massen-Eingabefenster.")
 async def cmd_addm(ctx):
     is_owner = (ctx.author.id == OWNER_ID)
     user_factions = get_user_factions(ctx.author)
-    if not user_factions and not is_owner:
-        return
-    await ctx.send("📝 Wähle die Fraktion für den Massen-Add:", view=BulkAddButtonView(ctx.author.id, user_factions, is_owner))
 
-@bot.command(name="clear_history")
+    if not user_factions and not is_owner:
+        msg = await ctx.send("❌ Du benötigst entsprechende Berechtigungen.")
+        await asyncio.sleep(10)
+        try:
+            await msg.delete()
+            await ctx.message.delete()
+        except Exception:
+            pass
+        return
+
+    view = BulkAddButtonView(ctx.author.id, user_factions, is_owner)
+    msg = await ctx.send("📝 **Wähle den Bereich aus, um das große Text-Eingabefenster zu öffnen:**", view=view)
+    
+    await asyncio.sleep(300)
+    try:
+        await msg.delete()
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+@bot.command(name="clear_history", description="[Owner Only] Setzt die Archiv-History aller Fraktionen zurück.")
 async def cmd_clear_history(ctx):
     if ctx.author.id != OWNER_ID:
+        await ctx.send("❌ Nur für den Bot-Owner.")
         return
+
     for faction in FILES.keys():
-        with open(os.path.join(HISTORY_DIR, f"history_{faction}.json"), "w", encoding="utf-8") as f:
-            json.dump([], f, ensure_ascii=False, indent=4)
-    await ctx.send("🧹 Archiv geleert.")
+        h_file = os.path.join(HISTORY_DIR, f"history_{faction}.json")
+        try:
+            async with file_lock:
+                with open(h_file, "w", encoding="utf-8") as f:
+                    json.dump([], f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            logger.error(f"Fehler beim Leeren der History ({faction}): {e}")
 
-@bot.command(name="setup_blacklist")
+    msg = await ctx.send("🧹 **Sämtliche Archiv-Testdaten wurden erfolgreich zurückgesetzt!**")
+    await log_system(f"⚙️ **History zurückgesetzt** durch {ctx.author.mention}.")
+    
+    await asyncio.sleep(300)
+    try:
+        await msg.delete()
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+@bot.command(name="setup_blacklist", description="Erstellt das Live-Blacklist Embed im Kanal.")
 async def cmd_setup_blacklist(ctx, faction: str = None):
-    is_owner = (ctx.author.id == OWNER_ID)
     user_factions = get_user_factions(ctx.author)
-    if not user_factions and not is_owner:
-        return
-    if faction:
-        closed_embed = discord.Embed(title="Blacklist", description="Klicke, um die Liste für 30 Sekunden zu öffnen.", color=DARK_GREEN)
-        msg = await ctx.channel.send(embed=closed_embed, view=PublicBlacklistExpandView(faction))
-        config["bound_messages"].append({"channel_id": ctx.channel.id, "faction": faction, "message_ids": [msg.id]})
-        await save_config()
-        await ctx.send(f"✅ Setup für {faction} eingerichtet.")
-    else:
-        await ctx.send("Wähle die Fraktion:", view=SetupBlacklistSelectView(ctx.author.id, ctx.channel, is_owner, user_factions))
+    is_owner = (ctx.author.id == OWNER_ID)
 
-@bot.command(name="set_action_log")
+    if not user_factions and not is_owner:
+        await ctx.send("❌ Du benötigst entsprechende Berechtigungen.")
+        return
+
+    if faction:
+        faction = faction.lower()
+        if faction not in ["medic", "army", "pd"]:
+            await ctx.send("❌ Ungültige Auswahl. Nutze: `medic`, `army` oder `pd`.")
+            return
+        if not check_faction_permission(ctx.author, faction):
+            await ctx.send(f"❌ Du hast keine Rechte als **{faction.upper()}**-Verantwortlicher!")
+            return
+
+        channel = ctx.channel
+        is_locked = config.get("lockdown", False)
+        faction_names = {"medic": "Mediziner Lomita Blacklist", "army": "Army Blacklist", "pd": "PD Blacklist"}
+        title_name = faction_names.get(faction, "Blacklist")
+
+        closed_embed = discord.Embed(
+            title=f"<:7990blacklistedids:1546843988328316928> {title_name}",
+            description="🔒 **SYSTEM IM LOCKDOWN**\n\n*Die Einsicht ist gesperrt.*" if is_locked else "Klicke auf den Button unten, um die aktuelle Blacklist für **30 Sekunden** für alle sichtbar im Kanal zu öffnen.\n\n*Bei jedem Aufruf wird ein neuer, eindeutiger Sicherheitscode generiert.*",
+            color=DARK_RED if is_locked else DARK_GREEN,
+            timestamp=datetime.now()
+        )
+        closed_embed.set_footer(text="🔒 Gesichertes Abrufsystem | Schließt automatisch nach 30 Sekunden")
+
+        view = PublicBlacklistExpandView(faction)
+        msg_obj = await channel.send(embed=closed_embed, view=view)
+
+        config["bound_messages"] = [b for b in config["bound_messages"] if not (b.get("channel_id") == channel.id and b.get("faction") == faction)]
+        config["bound_messages"].append({"channel_id": channel.id, "faction": faction, "message_ids": [msg_obj.id]})
+        await save_config()
+        
+        msg = await ctx.send(f"✅ **{faction.upper()}**-Blacklist in {channel.mention} eingerichtet!")
+        await log_system(f"⚙️ **Setup:** {faction.upper()} in {channel.mention} durch {ctx.author.mention}.")
+        
+        await asyncio.sleep(300)
+        try:
+            await msg.delete()
+            await ctx.message.delete()
+        except Exception:
+            pass
+        return
+
+    view = SetupBlacklistSelectView(ctx.author.id, ctx.channel, is_owner, user_factions)
+    msg = await ctx.send("Wähle den Bereich für dieses Blacklist-Embed aus:", view=view)
+    
+    await asyncio.sleep(300)
+    try:
+        await msg.delete()
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+@bot.command(name="set_action_log", description="Setzt den Aktions-Log Kanal auf den aktuellen Kanal.")
 async def cmd_set_action_log(ctx):
     is_owner = (ctx.author.id == OWNER_ID)
     user_factions = get_user_factions(ctx.author)
-    if not user_factions and not is_owner:
-        return
-    await ctx.send("Wähle den Ziel-Bereich:", view=ActionLogSelectView(ctx.author.id, ctx.channel, is_owner, user_factions))
 
-@bot.command(name="set_system_log")
+    if not user_factions and not is_owner:
+        await ctx.send("❌ Du benötigst entsprechende Berechtigungen.")
+        return
+
+    channel = ctx.channel
+
+    if len(user_factions) == 1 and not is_owner:
+        faction = user_factions[0]
+        if "action_log_channels" not in config:
+            config["action_log_channels"] = {"medic": None, "army": None, "pd": None, "all": None}
+        
+        config["action_log_channels"][faction] = channel.id
+        await save_config()
+
+        msg = await ctx.send(f"✅ Aktions-Log für **{faction.upper()}** wurde automatisch auf {channel.mention} gesetzt.")
+        await log_system(f"⚙️ **Aktions-Log gesetzt:** `{faction.upper()}` in {channel.mention} durch {ctx.author.mention}.")
+        
+        await asyncio.sleep(300)
+        try:
+            await msg.delete()
+            await ctx.message.delete()
+        except Exception:
+            pass
+        return
+
+    view = ActionLogSelectView(ctx.author.id, channel, is_owner, user_factions)
+    msg = await ctx.send(f"Wähle aus, für welchen Bereich {channel.mention} als Aktions-Log dienen soll:", view=view)
+    
+    await asyncio.sleep(300)
+    try:
+        await msg.delete()
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+@bot.command(name="set_system_log", description="[Owner Only] Setzt System-Log.")
 async def cmd_set_system_log(ctx, channel_input: str):
     if ctx.author.id != OWNER_ID:
+        await ctx.send("❌ Nur für den Bot-Owner.")
         return
-    target_id = int(channel_input) if channel_input.isdigit() else int(re.search(r'<#(\d+)>', channel_input).group(1))
+
+    target_id = int(channel_input) if channel_input.isdigit() else int(re.search(r'<#(\d+)>', channel_input).group(1)) if re.search(r'<#(\d+)>', channel_input) else None
+    if not target_id:
+        msg = await ctx.send("❌ Ungültiger Kanal.")
+        await asyncio.sleep(60)
+        try:
+            await msg.delete()
+            await ctx.message.delete()
+        except Exception:
+            pass
+        return
+
     config["system_log_channel"] = target_id
     await save_config()
-    await ctx.send("✅ System-Log Kanal gesetzt.")
+    msg = await ctx.send("✅ System-Log Kanal gesetzt.")
+    
+    await asyncio.sleep(300)
+    try:
+        await msg.delete()
+        await ctx.message.delete()
+    except Exception:
+        pass
 
-@bot.command(name="set_snitch")
+@bot.command(name="set_snitch", description="[Owner Only] Öffnet Modal für Snitch URL.")
 async def cmd_set_snitch(ctx):
     if ctx.author.id != OWNER_ID:
+        await ctx.send("❌ Nur für den Bot-Owner.")
         return
-    await ctx.send("Snitch konfigurieren:", view=SnitchButtonView(ctx.author.id))
+    view = SnitchButtonView(ctx.author.id)
+    msg = await ctx.send("Klicke auf den Button, um die Dead Man's Snitch URL einzugeben:", view=view)
+    
+    await asyncio.sleep(300)
+    try:
+        await msg.delete()
+        await ctx.message.delete()
+    except Exception:
+        pass
 
-@bot.command(name="restart")
+@bot.command(name="restart", description="[Owner Only] Startet Bot neu.")
 async def cmd_restart(ctx):
     if ctx.author.id != OWNER_ID:
+        await ctx.send("❌ Nur für den Bot-Owner.")
         return
-    await ctx.send("🔄 Neustart...")
+    msg = await ctx.send("🔄 Neustart...")
+    await asyncio.sleep(2)
+    try:
+        await msg.delete()
+        await ctx.message.delete()
+    except Exception:
+        pass
     await bot.close()
 
 @bot.event
@@ -1106,13 +1978,32 @@ async def on_ready():
         daily_backup_task.start()
     if not system_health_check.is_running():
         system_health_check.start()
+
     try:
-        await bot.tree.sync()
+        for guild in bot.guilds:
+            bot.tree.clear_commands(guild=guild)
+            await bot.tree.sync(guild=guild)
+        logger.info("🧹 Alte Server-Befehle gelöscht.")
+
+        synced = await bot.tree.sync()
+        logger.info(f"🌐 Globale Befehle erfolgreich synchronisiert: {len(synced)} Befehle.")
     except Exception as e:
-        logger.error(f"Sync Fehler: {e}")
+        logger.error(f"Fehler beim Sync: {e}")
+
+    await log_system(f"🚀 **Bot Online:** Erfolgreich gestartet als `{bot.user.name}`.")
     print(f"=== {bot.user.name} IST ONLINE UND BEREIT ===")
+
+@bot.event
+async def on_disconnect():
+    logger.warning("Bot vom Discord Gateway getrennt!")
+
+@bot.event
+async def on_resumed():
+    await log_system("🔄 **Verbindung wiederhergestellt**", level="INFO")
 
 if __name__ == "__main__":
     TOKEN = os.getenv("DISCORD_TOKEN")
-    if TOKEN:
+    if not TOKEN:
+        print("FEHLER: 'DISCORD_TOKEN' Umgebungsvariable ist nicht gesetzt!")
+    else:
         bot.run(TOKEN)
