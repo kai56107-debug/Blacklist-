@@ -44,19 +44,24 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-HISTORY_DIR = "history"
-BACKUP_DIR = "backups"
+# ==========================================
+# DAUERHAFTE SPEICHERPFADE AUF DEM HANDY
+# ==========================================
+BASE_DIR = "/sdcard/Blacklist"
+
+HISTORY_DIR = os.path.join(BASE_DIR, "history")
+BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(HISTORY_DIR, exist_ok=True)
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 FILES = {
-    "medic": "blacklist_medics.json",
-    "army": "blacklist_army.json",
-    "pd": "blacklist_pd.json"
+    "medic": os.path.join(BASE_DIR, "blacklist_medics.json"),
+    "army": os.path.join(BASE_DIR, "blacklist_army.json"),
+    "pd": os.path.join(BASE_DIR, "blacklist_pd.json")
 }
-CONFIG_FILE = "config.json"
-KEYWORDS_FILE = "keywords.json"
-WATERMARK_FILE = "watermarks.json"
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+KEYWORDS_FILE = os.path.join(BASE_DIR, "keywords.json")
+WATERMARK_FILE = os.path.join(BASE_DIR, "watermarks.json")
 
 blacklists = {"medic": [], "army": [], "pd": []}
 watermark_database = {}
@@ -78,7 +83,7 @@ removal_attempts = {}
 def load_data():
     global blacklists, config, keywords, watermark_database
     
-    old_legacy_file = "blacklist.json"
+    old_legacy_file = os.path.join(BASE_DIR, "blacklist.json")
     medic_file = FILES["medic"]
     if os.path.exists(old_legacy_file) and not os.path.exists(medic_file):
         try:
@@ -210,6 +215,7 @@ async def trigger_silent_alarm(interaction: discord.Interaction, command_name: s
         f"• **Status:** Aktion wurde blockiert."
     )
     await log_system(alarm_msg, level="WARNING")
+
 def check_database_integrity():
     ok_count = 0
     total = len(FILES)
@@ -308,6 +314,7 @@ def validate_and_clean_name(raw_input: str):
 
     note_str = ", ".join(extracted_notes) if extracted_notes else None
     return clean_name, note_str, None
+
 def format_blacklist_embeds(faction: str, entries_list, show_notes: bool = False, source_info: str = "Öffentlicher Kanal", is_owner_copy: bool = False):
     safe_faction = (faction or "UNKNOWN").lower()
     faction_names = {
@@ -378,7 +385,6 @@ def format_blacklist_embeds(faction: str, entries_list, show_notes: bool = False
     for idx, letter in enumerate(sorted_keys):
         letter_block = f"# {letter}\n"
         
-        # Getarnte ID NUR einbauen, wenn es KEINE Owner-Kopie ist
         if not is_owner_copy and idx % 2 == 1:
             letter_block += f"*Es gefällt {watermark_id} Personen die Blacklist*\n"
             
@@ -515,6 +521,7 @@ async def update_bound_messages(faction: str = None):
 
     config["bound_messages"] = clean_bound_list
     await save_config()
+
 @tasks.loop(hours=1)
 async def dead_mans_snitch_loop():
     snitch_url = config.get("snitch_url")
@@ -690,6 +697,7 @@ class BulkAddModal(discord.ui.Modal):
             await log_action(self.faction, action_embed)
 
         await interaction.followup.send(f"✅ **{added_count}** Namen zu **{f_name}** hinzugefügt, `{skipped_count}` übersprungen.", ephemeral=True)
+
 def build_dashboard_embed(author_name: str, author_avatar: str) -> discord.Embed:
     global PEAK_LATENCY, PREVIOUS_LATENCY
     
@@ -969,9 +977,10 @@ class FactionSelectView(discord.ui.View):
             await interaction.response.send_message("Das ist nicht dein Menü!", ephemeral=True)
             return
         await self.callback_func(interaction, self.select_item.values[0])
+
 class PublicBlacklistExpandView(discord.ui.View):
     def __init__(self, faction: str):
-        super().__init__(timeout=None)  # Button bleibt dauerhaft aktiv
+        super().__init__(timeout=None)
         self.faction = faction
 
     @discord.ui.button(label="📂 Blacklist anzeigen (30 Sec. offen)", style=discord.ButtonStyle.primary, custom_id="public_expand_blacklist_btn")
@@ -990,14 +999,10 @@ class PublicBlacklistExpandView(discord.ui.View):
         entries = blacklists.get(self.faction, [])
         ch_name = getattr(interaction.channel, "name", "Öffentlicher Kanal")
         
-        # Prüfung: Ist der klickende User der Owner?
         is_owner = (user_id == OWNER_ID)
-        
         source_info = f"Kanal-Klick in #{ch_name} von @{interaction.user.name} (ID: {user_id})" + (" [OWNER KOPIE]" if is_owner else "")
         
-        # is_owner_copy=is_owner blendet das Wasserzeichen bei deinem Klick aus!
         embeds = format_blacklist_embeds(self.faction, entries, show_notes=False, source_info=source_info, is_owner_copy=is_owner)
-        
         active_view = PublicBlacklistActiveView(self.faction, interaction.message.id)
         
         await interaction.message.edit(embed=embeds[0], view=active_view)
@@ -1012,10 +1017,9 @@ class PublicBlacklistExpandView(discord.ui.View):
         )
         await log_system(log_msg, level="WARNING" if click_count >= 5 else "INFO")
 
-
 class PublicBlacklistActiveView(discord.ui.View):
     def __init__(self, faction: str, message_id: int):
-        super().__init__(timeout=30)  # EXAKT 30 SEKUNDEN
+        super().__init__(timeout=30)
         self.faction = faction
         self.message_id = message_id
 
@@ -1105,6 +1109,7 @@ class ActionLogSelectView(discord.ui.View):
         label_name = "Alle Action-Logs (Master)" if selected_val == "all" else selected_val.upper()
         await interaction.response.edit_message(content=f"✅ Aktions-Log für **{label_name}** auf {self.channel.mention} gesetzt.", view=None)
         await log_system(f"⚙️ **Aktions-Log gesetzt:** `{label_name}` in {self.channel.mention} durch {interaction.user.mention}.")
+
 class SetupBlacklistSelectView(discord.ui.View):
     def __init__(self, author_id: int, channel: discord.TextChannel, is_owner: bool, user_factions: list):
         super().__init__(timeout=60)
@@ -1320,6 +1325,7 @@ class BlacklistPaginatorView(discord.ui.View):
             await interaction.response.edit_message(embed=self.embeds_list[self.current_page], view=self)
         else:
             await interaction.response.defer()
+
 @bot.tree.command(name="check", description="Durchsucht alle Fraktions-Blacklists gleichzeitig (mit Notiz & Fuzzy-Suche).")
 @app_commands.describe(name="Der zu prüfende Name oder Teilname")
 async def slash_check(interaction: discord.Interaction, name: str):
@@ -1687,6 +1693,7 @@ async def slash_remove_faction_admin(interaction: discord.Interaction, faction: 
 
     view = RemoveAdminView(faction, admins, interaction.guild)
     await interaction.response.send_message("Wähle den zu entfernenden Admin:", view=view, ephemeral=True)
+
 @bot.command(name="verify", description="Wertet eine Kopierschutz-ID aus (z.B. !verify 64108).")
 async def cmd_verify(ctx, watermark_id: str = None):
     if not watermark_id:
