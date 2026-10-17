@@ -553,7 +553,6 @@ async def system_health_check():
     latency = round(bot.latency * 1000)
     if latency > 400:
         await log_system(f"📶 **Hohe API-Latenz:** `{latency} ms`", level="WARNING")
-
 class RemoveApprovalView(discord.ui.View):
     def __init__(self, request_id: str, faction: str, entry: dict, user_id: int):
         super().__init__(timeout=86400)
