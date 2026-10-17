@@ -553,6 +553,7 @@ async def system_health_check():
     latency = round(bot.latency * 1000)
     if latency > 400:
         await log_system(f"📶 **Hohe API-Latenz:** `{latency} ms`", level="WARNING")
+
 class RemoveApprovalView(discord.ui.View):
     def __init__(self, request_id: str, faction: str, entry: dict, user_id: int):
         super().__init__(timeout=86400)
@@ -696,6 +697,43 @@ class BulkAddModal(discord.ui.Modal):
             await log_action(self.faction, action_embed)
 
         await interaction.followup.send(f"✅ **{added_count}** Namen zu **{f_name}** hinzugefügt, `{skipped_count}` übersprungen.", ephemeral=True)
+
+class BulkAddButtonView(discord.ui.View):
+    def __init__(self, author_id: int, user_factions: list, is_owner: bool):
+        super().__init__(timeout=60)
+        self.author_id = author_id
+
+        faction_meta = {
+            "medic": {"label": "Mediziner", "description": "Massen-Eintrag für Mediziner", "emoji": "💊"},
+            "army": {"label": "Army", "description": "Massen-Eintrag für Army", "emoji": "🪖"},
+            "pd": {"label": "Police Department", "description": "Massen-Eintrag für PD", "emoji": "🛡️"}
+        }
+
+        options = []
+        target_factions = ["medic", "army", "pd"] if is_owner else user_factions
+        for f_key in target_factions:
+            if f_key in faction_meta:
+                meta = faction_meta[f_key]
+                options.append(discord.SelectOption(label=meta["label"], value=f_key, description=meta["description"], emoji=meta["emoji"]))
+
+        if not options:
+            options.append(discord.SelectOption(label="Keine Berechtigung", value="none"))
+
+        self.select_item = discord.ui.Select(placeholder="Wähle die Fraktion für den Massen-Eintrag...", options=options)
+        self.select_item.callback = self.select_callback
+        self.add_item(self.select_item)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Das ist nicht dein Menü!", ephemeral=True)
+            return
+
+        faction = self.select_item.values[0]
+        if faction == "none":
+            await interaction.response.edit_message(content="❌ Keine Berechtigung.", view=None)
+            return
+
+        await interaction.response.send_modal(BulkAddModal(faction))
 
 def build_dashboard_embed(author_name: str, author_avatar: str) -> discord.Embed:
     global PEAK_LATENCY, PREVIOUS_LATENCY
