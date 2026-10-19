@@ -336,7 +336,11 @@ def format_blacklist_embeds(faction: str, entries_list, show_notes: bool = False
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "entries_count": len(real_entries)
     }
-    asyncio.create_task(save_watermarks())
+    try:
+        with open(WATERMARK_FILE, "w", encoding="utf-8") as f:
+            json.dump(watermark_database, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        logger.error(f"Fehler beim Sofort-Speichern des Wasserzeichens: {e}")
 
     if not real_entries:
         embed = discord.Embed(
@@ -941,7 +945,6 @@ class PingDashboardView(discord.ui.View):
         help_embed.add_field(
             name="⚡ Slash-Befehle (/)",
             value="• `/add` – Einzelnen Spieler hinzufügen `[Fraktions-Admin]`\n"
-                  "• `/add_bulk` – Massen-Eingabefenster öffnen `[Fraktions-Admin]`\n"
                   "• `/remove` – Spieler entfernen (4-Augen-Prinzip) `[Fraktions-Admin]`\n"
                   "• `/check` – Blacklists durchsuchen (Master, mit Notiz & Fuzzy) `[Fraktions-Admin]`\n"
                   "• `/alias` – Alias zu Eintrag hinzufügen `[Fraktions-Admin]`\n"
